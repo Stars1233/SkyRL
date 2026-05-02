@@ -200,6 +200,12 @@ class RemoteInferenceClient:
     active_lora_name: Optional[str] = None
     """Name of the active LoRA adapter. If set, generation requests use this adapter instead of the base model."""
 
+    uses_lora_weight_sync: bool = False
+    """True when the trainer syncs LoRA adapters (rather than full/merged weights). When True,
+    `sleep()` is forced to level=1: level=2 discards the base model from VRAM with no CPU backup,
+    and LoRA-only broadcasts cannot repopulate it. Must be kept in sync with the same gate vLLM
+    uses for `enable_lora` (see `_uses_lora_weight_sync` in inference_servers/utils.py)."""
+
     tokenizer: Optional[Any] = None
     """Optional HF tokenizer for local tokenize/detokenize (avoids HTTP round-trips)."""
 
@@ -924,6 +930,15 @@ class RemoteInferenceClient:
         Returns:
             Dict mapping server_url to response.
         """
+        # Mirror BaseVLLMInferenceEngine.sleep: when the trainer syncs LoRA adapters
+        # only, force level=1 so the base model survives via CPU backup. level=2
+        # discards weights with no source to restore from on wake_up(["weights"]).
+        if self.uses_lora_weight_sync and level != 1:
+            logger.info(
+                "Forcing sleep level=1 (uses_lora_weight_sync=True); requested level=%d would discard the base model.",
+                level,
+            )
+            level = 1
         params: Dict[str, Any] = {"level": str(level)}
         if tags:
             params["tags"] = tags
@@ -1093,6 +1108,9 @@ class RemoteInferenceClient:
         After loading, generation requests will automatically use the LoRA adapter
         by setting the model name to the LoRA adapter name.
 
+        TODO(aaron): remove _unload_on_server and add back "load_inplace": True to payload after
+        vllm lora disk load bug is fixed.
+
         Args:
             lora_path: Path to the LoRA adapter on disk (must be accessible from servers).
 
@@ -1103,26 +1121,30 @@ class RemoteInferenceClient:
             raise ValueError("active_lora_name must be set on RemoteInferenceClient before loading a LoRA adapter.")
 
         lora_name = self.active_lora_name
-        payload = {
-            "lora_name": lora_name,
-            "lora_path": lora_path,
-            "load_inplace": True,
-        }
-
-        # Call /v1/load_lora_adapter on all servers directly.
-        # This endpoint returns a plain text response (not JSON), so we use a
-        # custom call instead of _call_all_servers which expects JSON.
+        # Both endpoints return plain text on success or JSON ErrorResponse on failure,
+        # so we use a session.post directly rather than _call_all_servers (which expects JSON).
         session = await self._get_session()
+
+        async def _unload_on_server(server_url: str) -> None:
+            """Remove the cached LoRARequest server-side. 404 on the first sync is expected."""
+            url = f"{server_url}/v1/unload_lora_adapter"
+            async with session.post(url, json={"lora_name": lora_name}) as resp:
+                if resp.status == 404:
+                    return
+                if resp.status >= 400:
+                    body = await resp.json()
+                    raise_for_status(resp, body)
 
         async def _load_on_server(server_url: str):
             url = f"{server_url}/v1/load_lora_adapter"
+            payload = {"lora_name": lora_name, "lora_path": lora_path}
             async with session.post(url, json=payload) as resp:
-                # vLLM returns 200 with text body on success, or JSON ErrorResponse on failure
                 if resp.status >= 400:
                     body = await resp.json()
                     raise_for_status(resp, body)
                 return server_url, {"status": resp.status, "body": await resp.text()}
 
+        await asyncio.gather(*[_unload_on_server(url) for url in self.server_urls])
         results = await asyncio.gather(*[_load_on_server(url) for url in self.server_urls])
 
         logger.info(f"Loaded LoRA adapter '{lora_name}' from {lora_path}")
