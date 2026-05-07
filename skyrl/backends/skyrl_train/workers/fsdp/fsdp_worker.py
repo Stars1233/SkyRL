@@ -196,6 +196,7 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
             model_config_kwargs=self.cfg.policy.model_config_kwargs,
             meta_init=use_meta,
             language_model_only=self.cfg.policy.language_model_only,
+            logprobs_chunk_size=self.cfg.logprobs_chunk_size,
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 
@@ -418,6 +419,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
             model_config_kwargs=self.cfg.ref.model_config_kwargs,
             meta_init=use_meta,
             language_model_only=self.cfg.ref.language_model_only,
+            logprobs_chunk_size=self.cfg.logprobs_chunk_size,
         )
         self._seq_parallel_monkey_patch(model=wrapped_model.model)
 
