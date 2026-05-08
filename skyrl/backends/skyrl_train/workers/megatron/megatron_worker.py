@@ -45,6 +45,11 @@ from skyrl.backends.skyrl_train.weight_sync import (
     WeightChunk,
     WeightExtractor,
 )
+from skyrl.backends.skyrl_train.workers.megatron.adapter_store import (
+    AdapterStore,
+    LoraSignature,
+    iter_opts,
+)
 from skyrl.backends.skyrl_train.workers.megatron.megatron_model_wrapper import (
     MegatronModelWrapper,
 )
@@ -546,6 +551,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         self.optimizer: DistributedOptimizer = None
         self.profiler: Profiler = None
         self._is_lora = self.cfg.policy.model.lora.rank > 0
+        # Per-worker store of LoRA adapter snapshots. Allocated only for the
+        # LoRA path; FFT runs single-tenant exactly as before.
+        self.adapter_store: Optional[AdapterStore] = AdapterStore() if self._is_lora else None
 
     def init_worker_process_group(self):
         """
@@ -924,6 +932,75 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
     def _set_pad_token_id(self, pad_token_id):
         # this already gets set in the init_model method
         pass
+
+    # ------------------------------------------------------------------
+    # Multi-LoRA / AdapterStore Ray-callable methods
+    # ------------------------------------------------------------------
+
+    def prime_optimizer_state(self) -> None:
+        """Materialise DistributedOptimizer state (exp_avg / exp_avg_sq).
+
+        Adam's state tensors are allocated lazily on the first non-trivial
+        step; without priming, the pristine snapshot would miss them.
+        Megatron exposes ``_init_optimizer_states_with_dummy_values()`` which
+        zero-fills grads + steps once + zero_grads, leaving the model weights
+        unchanged.
+        """
+        if not self._is_lora:
+            raise RuntimeError("prime_optimizer_state is only used on the LoRA path")
+        for _opt in iter_opts(self.optimizer):
+            init_fn = getattr(_opt, "_init_optimizer_states_with_dummy_values", None)
+            if init_fn is not None:
+                init_fn()
+
+    def register_pristine_adapter(self) -> None:
+        """Capture the current (freshly-initialised) LoRA state as the
+        pristine slot. Must be called once per worker, after
+        prime_optimizer_state.
+        """
+        if self.adapter_store is None:
+            raise RuntimeError("AdapterStore not initialised (FFT path)")
+        signature = LoraSignature.from_lora_config(
+            self.cfg.policy.model.lora,
+            lora_type=self.cfg.policy.megatron_config.lora_config.lora_type,
+        )
+        self.adapter_store.register_pristine(self.actor_module, self.optimizer, signature)
+
+    def register_adapter(self, model_id: str) -> None:
+        """Register a new LoRA adapter slot. The first call uses the live
+        state as the slot; subsequent calls seed from pristine.
+        """
+        if self.adapter_store is None:
+            raise RuntimeError("AdapterStore not initialised (FFT path)")
+        signature = self.adapter_store.signature
+        if signature is None:
+            raise RuntimeError("register_adapter called before register_pristine_adapter")
+        self.adapter_store.create(model_id, self.actor_module, self.optimizer, signature)
+
+    def delete_adapter(self, model_id: str) -> None:
+        if self.adapter_store is None:
+            raise RuntimeError("AdapterStore not initialised (FFT path)")
+        self.adapter_store.delete(model_id)
+
+    def swap_to_adapter(self, model_id: str) -> None:
+        """Make ``model_id`` the live adapter on this worker. No-op if it
+        already is. Issues local tensor.copy_()s + dp_group barriers.
+        """
+        if self.adapter_store is None:
+            return  # FFT path: no-op
+        self.adapter_store.swap_to(model_id, self.actor_module, self.optimizer)
+
+    def adapter_store_state(self) -> dict:
+        """Diagnostic: return current_id + registered model_ids. Cheap; useful
+        for tests."""
+        if self.adapter_store is None:
+            return {"enabled": False}
+        return {
+            "enabled": True,
+            "current_id": self.adapter_store.current_id,
+            "registered": self.adapter_store.registered_ids(),
+            "num_adapters": self.adapter_store.num_adapters(),
+        }
 
 
 class MegatronRefWorkerBase(MegatronWorker, RefWorkerBase):
