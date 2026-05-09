@@ -1,4 +1,5 @@
 import os
+import shutil
 from collections import defaultdict
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
@@ -851,7 +852,9 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             training_dtype=torch.bfloat16 if self.cfg.bf16 else torch.float32,
         )
 
-    async def _save_lora_adapters_and_sync(self, lora_sync_path, inference_engine_client):
+    async def _save_lora_adapters_and_sync(
+        self, lora_sync_path, inference_engine_client, lora_name: str = SKYRL_LORA_ADAPTER_NAME
+    ):
         """Export LoRA adapter weights via Megatron-Bridge and tell the inference engine to load them.
 
         All ranks participate in the collective export (TP/PP/EP gathering is
@@ -894,15 +897,18 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             )
 
             if isinstance(inference_engine_client, RemoteInferenceClient):
-                await inference_engine_client.load_lora_adapter(SKYRL_LORA_ADAPTER_NAME, lora_sync_path)
+                await inference_engine_client.load_lora_adapter(lora_name, lora_sync_path)
             else:
-                lora_request = LoraLoadRequest(lora_path=lora_sync_path)
+                lora_request = LoraLoadRequest(lora_path=lora_sync_path, lora_name=lora_name)
                 await inference_engine_client.update_named_weights(lora_request)
 
         torch.distributed.barrier()
 
     async def broadcast_to_inference_engines(
-        self, inference_engine_client: "InferenceEngineInterface", inference_engine_cfg: "InferenceEngineConfig"
+        self,
+        inference_engine_client: "InferenceEngineInterface",
+        inference_engine_cfg: "InferenceEngineConfig",
+        model_id: Optional[str] = None,
     ):
         use_prefix_cache = inference_engine_cfg.enable_prefix_caching
         generator_dtype = str_to_torch_dtype(inference_engine_cfg.model_dtype)
@@ -914,8 +920,12 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
         torch.cuda.empty_cache()
 
         if self._is_lora and not self.cfg.policy.megatron_config.lora_config.merge_lora:
-            lora_sync_path = self.cfg.policy.model.lora.lora_sync_path
-            await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client)
+            # AdapterStore.swap_to has already made `model_id` the live adapter
+            # before we get here; sync that adapter to vLLM under its own name
+            # so sample(model=<model_id>) routes correctly. Single-tenant
+            # (model_id=None) keeps the legacy shared path + name.
+            lora_name, lora_sync_path = self._resolve_lora_sync_target(model_id)
+            await self._save_lora_adapters_and_sync(lora_sync_path, inference_engine_client, lora_name=lora_name)
         else:
             # Extract and send weights using the sender created at init time
             weight_metadata = self.weight_extractor.get_weight_metadata(generator_dtype)
@@ -977,10 +987,36 @@ class MegatronPolicyWorkerBase(MegatronWorker, PolicyWorkerBase):
             raise RuntimeError("register_adapter called before register_pristine_adapter")
         self.adapter_store.create(model_id, self.actor_module, self.optimizer, signature)
 
+    def _resolve_lora_sync_target(self, model_id: Optional[str]) -> tuple[str, str]:
+        """Return ``(lora_name, lora_sync_path)`` for a given Tinker model_id.
+
+        The single-tenant fallback (``model_id=None``) uses the default
+        shared adapter name + shared sync path. Multi-tenant routes through
+        ``os.path.basename`` on the lora_sync_path.
+        """
+        base_sync_path = self.cfg.policy.model.lora.lora_sync_path
+        safe_model_id = os.path.basename(model_id) if model_id is not None else None
+        if safe_model_id:
+            return safe_model_id, os.path.join(base_sync_path, safe_model_id)
+        return SKYRL_LORA_ADAPTER_NAME, base_sync_path
+
     def delete_adapter(self, model_id: str) -> None:
         if self.adapter_store is None:
             raise RuntimeError("AdapterStore not initialised (FFT path)")
         self.adapter_store.delete(model_id)
+        # Drop the per-tenant safetensors subdir written by
+        # _save_lora_adapters_and_sync. Rank 0 wrote it; rank 0 cleans it.
+        # Other ranks no-op. Best-effort — log on failure but don't propagate.
+        if self._rank == 0:
+            _, lora_sync_path = self._resolve_lora_sync_target(model_id)
+            base_sync_path = self.cfg.policy.model.lora.lora_sync_path
+            if lora_sync_path != base_sync_path:
+                try:
+                    shutil.rmtree(lora_sync_path)
+                except FileNotFoundError:
+                    pass  # already gone, fine
+                except OSError as e:
+                    logger.warning(f"Failed to remove lora_sync subdir {lora_sync_path}: {e}")
 
     def swap_to_adapter(self, model_id: str) -> None:
         """Make ``model_id`` the live adapter on this worker. No-op if it

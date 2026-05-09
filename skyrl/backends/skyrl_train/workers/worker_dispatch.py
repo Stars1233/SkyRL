@@ -454,14 +454,21 @@ class WorkerDispatch:
             )
         )
 
-    def _broadcast_to_inference_engines(self, inference_engine_client) -> None:
-        """Broadcast policy weights to inference engines. Helper for save_weights_for_sampler."""
+    def _broadcast_to_inference_engines(self, inference_engine_client, model_id: Optional[str] = None) -> None:
+        """Broadcast policy weights to inference engines. Helper for save_weights_for_sampler.
+
+        ``model_id`` is forwarded to the worker so that, on the LoRA path, the
+        adapter is saved into a per-tenant subdir of ``lora_sync_path`` and
+        registered on vLLM under that name. None preserves single-tenant
+        behavior (the legacy ``SKYRL_LORA_ADAPTER_NAME`` path).
+        """
         ray.get(
             self._actor_groups["policy"].async_run_ray_method(
                 "pass_through",
                 "broadcast_to_inference_engines",
                 inference_engine_client,
                 self.cfg.generator.inference_engine,
+                model_id=model_id,
             )
         )
 
@@ -481,11 +488,14 @@ class WorkerDispatch:
             return
         self._offload("policy", offload_optimizer=True, offload_model=True)
 
-    async def save_weights_for_sampler(self) -> None:
+    async def save_weights_for_sampler(self, model_id: Optional[str] = None) -> None:
         """
         Tinker API method to prepare updated parameters for sampling.
 
-        Syncs weights to inference engine for sampling.
+        Syncs weights to inference engine for sampling. When ``model_id`` is
+        provided we ensure the corresponding LoRA adapter is the live one
+        before broadcasting, and tell the worker to register the adapter on
+        vLLM under ``model_id``.
         """
         if self._inference_engine_client is None:
             raise RuntimeError(
@@ -495,9 +505,12 @@ class WorkerDispatch:
 
         # Sync weights to inference engine
         self._prepare_for_weight_sync()
+        # Make the requested adapter live on every worker before broadcasting
+        # — otherwise we'd export some other tenant's LoRA weights to vLLM.
+        self.ensure_active_adapter("policy", model_id)
         if self.colocate_all:
             await self._inference_engine_client.wake_up(tags=["weights"])
-            self._broadcast_to_inference_engines(self._inference_engine_client)
+            self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
             self._finish_weight_sync()
             await self._inference_engine_client.wake_up(tags=["kv_cache"])
         else:
@@ -505,7 +518,7 @@ class WorkerDispatch:
             # reading partially-updated weights during the NCCL broadcast.
             await self._inference_engine_client.pause_generation()
             try:
-                self._broadcast_to_inference_engines(self._inference_engine_client)
+                self._broadcast_to_inference_engines(self._inference_engine_client, model_id=model_id)
                 self._finish_weight_sync()
             finally:
                 await self._inference_engine_client.resume_generation()

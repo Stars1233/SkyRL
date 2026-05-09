@@ -10,12 +10,16 @@ Coverage:
     swap-out, B-training, swap-in cycle (loss continues to improve on A).
   - test_rank_mismatch_rejected: a second create_model with different rank
     is hard-rejected at the controller-level signature gate.
-  - test_sample_with_two_adapters_errors: v1 single-tenant guard on
-    save_sampler_checkpoint fires when more than one LoRA is registered.
   - test_per_adapter_step_isolation: A's and B's pre-update losses are
     bit-exact when they were both pristine + saw identical data.
   - test_delete_then_train_remaining: deleting one of two adapters does
     not tear down the Ray runtime; the other adapter continues to train.
+  - test_per_adapter_sample_isolation: pristine adapters following an
+    identical training trajectory produce bit-identical greedy samples
+    on vLLM at every step.
+  - test_two_adapters_sample_independently: weight-sync of adapter B
+    does not clobber adapter A's slot on vLLM; A's optimizer state
+    survives B's intervention end-to-end through sampling.
 
 Run with:
   uv run --extra tinker --extra megatron --with pytest --with pytest-timeout \\
@@ -52,9 +56,11 @@ BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
 TINKER_API_KEY = "tml-dummy"
 TEST_PORT = 8011
 
-# Tiny config: 1 GPU, no TP/PP, single DP rank.
-# With a tiny model + LoRA rank 8, this fits comfortably in
-# any modern GPU.
+# Tiny config: 1 GPU for the policy worker, 1 for vLLM. With a tiny model
+# + LoRA rank 8, this fits comfortably on any modern GPU pair. merge_lora
+# is False so vLLM serves per-tenant LoRA adapters by name — required for
+# the per-adapter sampling tests below; harmless for the train-only tests
+# since they don't hit the sample/sync path.
 BACKEND_CONFIG = {
     "strategy": "megatron",
     "trainer.placement.policy_num_gpus_per_node": 1,
@@ -62,6 +68,9 @@ BACKEND_CONFIG = {
     "trainer.placement.colocate_all": False,
     "trainer.policy.megatron_config.tensor_model_parallel_size": 1,
     "trainer.policy.megatron_config.pipeline_model_parallel_size": 1,
+    "trainer.policy.megatron_config.lora_config.merge_lora": False,
+    "trainer.policy.model.lora.max_loras": 4,
+    "trainer.policy.model.lora.max_cpu_loras": 4,
 }
 
 
@@ -149,16 +158,32 @@ def service_client(server):
     return tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_PORT}/", api_key=TINKER_API_KEY)
 
 
+def _sample_greedy(tc, name, tok, prompt: str, max_tokens: int = 8) -> list[int]:
+    """Sync ``tc``'s LoRA weights to vLLM under ``name``, then greedy-sample.
+    Returns the list of generated token ids — deterministic given identical
+    weights + prompt + sampling params (temperature=0)."""
+    sampler = tc.save_weights_and_get_sampling_client(name=name)
+    prompt_ids = tok.encode(prompt, add_special_tokens=True)
+    out = sampler.sample(
+        prompt=tinker_types.ModelInput.from_ints(prompt_ids),
+        num_samples=1,
+        sampling_params=tinker_types.SamplingParams(
+            max_tokens=max_tokens,
+            temperature=0.0,
+            top_k=1,
+            seed=0,
+        ),
+    ).result()
+    return list(out.sequences[0].tokens)
+
+
 def test_two_adapters_train_independently(service_client):
     """Two LoRA adapters share the same base model; training one must not
     contaminate the other's weights.
 
-    We don't push weights to vLLM here because save_weights_for_sampler is
-    deliberately gated to single-adapter in v1 (see
-    test_sample_with_two_adapters_errors). Isolation is verified by
-    asserting A's loss continues to improve after we've swapped to B and
-    back — that's only possible if A's optimizer state survived the
-    swap-out + B-training + swap-in cycle.
+    Isolation is verified by asserting A's loss continues to improve
+    after we've swapped to B and back — that's only possible if A's
+    optimizer state survived the swap-out + B-training + swap-in cycle.
     """
     client_a = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
     client_b = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
@@ -195,15 +220,6 @@ def test_rank_mismatch_rejected(service_client):
     with pytest.raises(Exception) as exc:
         service_client.create_lora_training_client(base_model=BASE_MODEL, rank=16)
     assert "signature mismatch" in str(exc.value).lower() or "rank" in str(exc.value).lower()
-
-
-def test_sample_with_two_adapters_errors(service_client):
-    a = service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
-    service_client.create_lora_training_client(base_model=BASE_MODEL, rank=8)
-    with pytest.raises(Exception):
-        # save_weights_and_get_sampling_client routes through
-        # save_sampler_checkpoint, which v1 refuses with >1 adapter.
-        a.save_weights_and_get_sampling_client(name="should_fail")
 
 
 def test_per_adapter_step_isolation(service_client):
@@ -280,3 +296,116 @@ def test_delete_then_train_remaining(service_client):
     # ray.shutdown when only A was deleted.
     b.forward_backward(data, "cross_entropy").result()
     b.optim_step(tinker_types.AdamParams(learning_rate=1e-3)).result()
+
+
+# ---------------------------------------------------------------------------
+# Per-adapter sampling tests. These exercise the per-tenant weight-sync
+# path: save_weights_for_sampler(model_id) loads the LoRA into vLLM under
+# model_id's name, and sample(model=model_id) routes to that adapter.
+# Require merge_lora=False on the Megatron side (set in BACKEND_CONFIG).
+# ---------------------------------------------------------------------------
+
+
+def test_per_adapter_sample_isolation(service_client):
+    """Analog of test_per_adapter_step_isolation but exercising the
+    sample + weight-sync path. Two pristine adapters following an
+    identical training trajectory (ALT order on identical data) must
+    produce bit-identical greedy samples at every step.
+
+    Failure modes this catches:
+      - vLLM serves the wrong adapter for one of the model_ids (samples
+        diverge while training history is identical).
+      - load_lora_adapter under name "B" silently clobbers the adapter
+        previously registered under "A" (sampling A returns B's weights).
+      - The per-param-group `step` snapshot regresses (different bias
+        correction → different params → different greedy tokens).
+    """
+    sc = service_client
+    a = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    b = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    tok = a.get_tokenizer()
+    data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
+    sample_prompt = "Question: 2+2?\nAnswer:"
+
+    # Step 0: both adapters pristine. Sample both. Identical-by-construction.
+    tokens_a0 = _sample_greedy(a, name="iso_a0", tok=tok, prompt=sample_prompt)
+    tokens_b0 = _sample_greedy(b, name="iso_b0", tok=tok, prompt=sample_prompt)
+    print(f"\n[sample_isolation] step 0: A={tokens_a0} B={tokens_b0}")
+    assert tokens_a0 == tokens_b0, (
+        f"Pristine adapters returned different greedy samples: A={tokens_a0!r} B={tokens_b0!r}. "
+        "Either weights leaked across adapters on vLLM or sampling is non-deterministic."
+    )
+
+    # Step 1: ALT-order training, both adapters take one optim_step on
+    # identical data with the same LR. After that, save+sample both.
+    a.forward_backward(data, "cross_entropy").result()
+    a.optim_step(tinker_types.AdamParams(learning_rate=1e-3)).result()
+    b.forward_backward(data, "cross_entropy").result()
+    b.optim_step(tinker_types.AdamParams(learning_rate=1e-3)).result()
+
+    tokens_a1 = _sample_greedy(a, name="iso_a1", tok=tok, prompt=sample_prompt)
+    tokens_b1 = _sample_greedy(b, name="iso_b1", tok=tok, prompt=sample_prompt)
+    print(f"[sample_isolation] step 1: A={tokens_a1} B={tokens_b1}")
+    assert tokens_a1 == tokens_b1, (
+        f"After identical training, samples diverge: A={tokens_a1!r} B={tokens_b1!r}. "
+        "Per-tenant routing on vLLM (or the param-group step snapshot) likely regressed."
+    )
+
+
+def test_two_adapters_sample_independently(service_client):
+    """Analog of test_two_adapters_train_independently but exercising
+    sample + weight-sync. A trains; B trains with a different LR in
+    between; A continues training. Final assertions:
+
+      - A's continued sample differs from A's pre-resumption sample —
+        A's training kept progressing (optimizer state survived B's
+        intervention, including the per-tenant load_lora_adapter call
+        that B's sync issued).
+      - A's continued sample differs from B's sample — vLLM's
+        load_lora_adapter("b_*", ...) did NOT clobber the adapter
+        previously registered under "a_*".
+    """
+    sc = service_client
+    a = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    b = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)
+    tok = a.get_tokenizer()
+    data = [_make_datum(tok, "Question: 1+1?\nAnswer:", " 2")]
+    sample_prompt = "Question: 2+2?\nAnswer:"
+
+    # A: priming + one real step at lr=1e-2 (large enough to move tokens).
+    for _ in range(2):
+        a.forward_backward(data, "cross_entropy").result()
+        a.optim_step(tinker_types.AdamParams(learning_rate=1e-2)).result()
+    tokens_a_first = _sample_greedy(a, name="indep_a1", tok=tok, prompt=sample_prompt)
+
+    # B: one step with a deliberately different LR, registers a different
+    # adapter on vLLM.
+    b.forward_backward(data, "cross_entropy").result()
+    b.optim_step(tinker_types.AdamParams(learning_rate=5e-2)).result()
+    tokens_b = _sample_greedy(b, name="indep_b", tok=tok, prompt=sample_prompt)
+
+    # A: one more step. If A's optimizer state was preserved across B's
+    # swap-out + train + sync, this step should produce a sane gradient
+    # update.
+    a.forward_backward(data, "cross_entropy").result()
+    a.optim_step(tinker_types.AdamParams(learning_rate=1e-2)).result()
+    tokens_a_continued = _sample_greedy(a, name="indep_a2", tok=tok, prompt=sample_prompt)
+    print(
+        f"\n[sample_independently] tokens_a_first={tokens_a_first}\n"
+        f"[sample_independently] tokens_b      ={tokens_b}\n"
+        f"[sample_independently] tokens_a_cont ={tokens_a_continued}"
+    )
+
+    # A's training kept progressing through B's intervention.
+    assert tokens_a_continued != tokens_a_first, (
+        f"A's tokens did not change after one more optim_step (A={tokens_a_continued!r}, "
+        f"prior={tokens_a_first!r}). A's optimizer state may have been wiped by B."
+    )
+
+    # A's final adapter on vLLM is A's trained state, not B's. If B's
+    # load_lora_adapter call had clobbered A's slot on vLLM, sampling A
+    # after re-syncing would surface that as A == B.
+    assert tokens_a_continued != tokens_b, (
+        f"A's continued sample matches B's sample: A={tokens_a_continued!r}, B={tokens_b!r}. "
+        "B's adapter sync may have clobbered A's slot on vLLM."
+    )
