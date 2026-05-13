@@ -5,6 +5,7 @@ import io
 import os
 import tarfile
 import tempfile
+from typing import Callable
 
 import ray
 import torch
@@ -137,6 +138,13 @@ class SkyRLTrainBackend(AbstractBackend):
         # New inference infrastructure
         self._server_groups: list = []
         self._inference_router = None
+
+        # Optional hook invoked on inference-engine state changes (after
+        # _create_new_inference_client, on delete_model teardown). The host
+        # (e.g. the Tinker engine subprocess) wires the persistence side via
+        # set_inference_state_publisher. None when running outside a host
+        # that needs to be notified (unit tests, non-Tinker uses).
+        self._inference_state_publisher: Callable[[str | None], None] | None = None
 
     def has_model(self, model_id: str) -> bool:
         return model_id in self._model_ids_to_role
@@ -325,6 +333,29 @@ class SkyRLTrainBackend(AbstractBackend):
             self._cfg.generator.inference_engine,
         )
 
+    def set_inference_state_publisher(self, publisher: Callable[[str | None], None]) -> None:
+        """Wire a callback invoked when the inference proxy URL changes.
+
+        Called by the host (e.g. the Tinker engine subprocess) after backend
+        construction. The callback receives the current proxy URL after a
+        new inference engine is brought up, or ``None`` on teardown. The
+        backend has no opinion on what the callback does — typical use is
+        to persist the URL somewhere the API process can read.
+        """
+        self._inference_state_publisher = publisher
+
+    def _publish_inference_state(self, proxy_url: str | None) -> None:
+        """Invoke the publisher if set; best-effort (failure must not raise).
+
+        Callers rely on local state being reset regardless of publish outcome.
+        """
+        if self._inference_state_publisher is None:
+            return
+        try:
+            self._inference_state_publisher(proxy_url)
+        except Exception as e:
+            logger.warning(f"Inference-state publisher failed (proxy_url={proxy_url!r}): {e}")
+
     def _create_new_inference_client(self):
         """Create new HTTP-based inference client."""
         from skyrl.backends.skyrl_train.inference_servers.setup import (
@@ -340,6 +371,10 @@ class SkyRLTrainBackend(AbstractBackend):
         self._inference_router = server_setup.router
         self._server_groups = server_setup.server_groups
         self._inference_engine_client = client
+
+        # Publish inference endpoint so the API can forward samples directly
+        # (only meaningful in non-colocated mode; the API gates on this).
+        self._publish_inference_state(server_setup.proxy_url)
 
     def _ensure_inference_engines(self):
         """Lazily create inference engines and init weight sync on first sampling-related call."""
@@ -496,6 +531,10 @@ class SkyRLTrainBackend(AbstractBackend):
         self._renderer = None
         self._colocate_pg = None
         self._base_lora_signature = None
+        # Local state is fully reset above. Notify the host last so a
+        # publisher failure can't leave the controller half-torn-down.
+        # Next _create_new_inference_client repopulates.
+        self._publish_inference_state(None)
         logger.info(f"Successfully deleted model {model_id}")
 
     def _to_training_batch(self, prepared_batch: types.PreparedModelPassBatch, role: str) -> TrainingInputBatch:
