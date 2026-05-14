@@ -18,6 +18,7 @@ try:
 except ImportError:
     from torch.distributed._tensor import DTensor
 
+from skyrl.backends.skyrl_train.distributed.dispatch import WorkerOutput
 from skyrl.backends.skyrl_train.distributed.fsdp_strategy import FSDPStrategy
 from skyrl.backends.skyrl_train.distributed.fsdp_utils import (
     should_use_meta_init,
@@ -27,7 +28,6 @@ from skyrl.backends.skyrl_train.inference_servers.remote_inference_client import
 )
 from skyrl.backends.skyrl_train.training_batch import (
     TrainingInputBatch,
-    TrainingOutputBatch,
 )
 from skyrl.backends.skyrl_train.weight_sync import (
     LoraLoadRequest,
@@ -308,12 +308,14 @@ class FSDPPolicyWorkerBase(PolicyWorkerBase):
     def forward(
         self,
         data: TrainingInputBatch,
-    ) -> TrainingOutputBatch:
+        loss_fn=None,
+        loss_fn_config=None,
+    ) -> WorkerOutput:
         """Run forward pass on data in inference mode.
 
         Reshard the model after forward pass to redistribute memory and allow for offloading to cpu.
         """
-        output = super().forward(data)
+        output = super().forward(data, loss_fn=loss_fn, loss_fn_config=loss_fn_config)
         # unshard the root FSDP module (https://pytorch.org/docs/stable/notes/fsdp.html#fsdp-notes)
         return output
 
@@ -373,7 +375,7 @@ class FSDPCriticWorkerBase(CriticWorkerBase):
     def forward(
         self,
         data: TrainingInputBatch,
-    ) -> TrainingOutputBatch:
+    ) -> WorkerOutput:
         """Run forward pass on data in inference mode.
 
         Reshard the model after forward pass to redistribute memory and allow for offloading to cpu.
@@ -421,7 +423,7 @@ class FSDPRefWorkerBase(RefWorkerBase):
     def forward(
         self,
         data: TrainingInputBatch,
-    ) -> TrainingOutputBatch:
+    ) -> WorkerOutput:
         """Run forward pass on data in inference mode.
 
         Reshard the model after forward pass to redistribute memory and allow for offloading to cpu.
