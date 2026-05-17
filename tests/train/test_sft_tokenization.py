@@ -4,6 +4,7 @@ CPU tests for SFT tokenization and collation helpers.
 uv run --isolated --extra dev --extra fsdp pytest tests/train/test_sft_tokenization.py -v
 """
 
+import json
 from dataclasses import dataclass
 
 import pytest
@@ -13,6 +14,7 @@ from transformers import AutoTokenizer
 from skyrl.train.config.sft_config import TrainOnWhat
 from skyrl.train.generators.utils import get_generation_prompt_ids
 from skyrl.train.sft_trainer import (
+    _normalize_chat_messages,
     collate_sft_batch,
     tokenize_chat_example,
     tokenize_sft_example,
@@ -546,3 +548,221 @@ def test_train_on_what_all_assistants_truncation(tokenizer):
         assert len(result["loss_mask"]) == result["num_actions"]
         # All loss_mask values should be 0 or 1
         assert all(v in (0, 1) for v in result["loss_mask"])
+
+
+# ---------------------------------------------------------------------------
+# Tool-calling datasets (APIGen-MT, xLAM, ToolACE, ...).
+# These ship per-row ``tools`` (function schemas), an optional per-row
+# ``system`` prompt, and ``messages`` containing assistant-with-tool_calls
+# and tool-result turns. ``tokenize_chat_example`` should:
+#   - normalize string-encoded ``tool_calls`` into the OpenAI list shape,
+#   - forward the per-row ``tools`` to ``apply_chat_template``,
+#   - prepend the per-row system message,
+#   - mask tool-result tokens to 0 and assistant-generated tokens to 1.
+# ---------------------------------------------------------------------------
+
+
+_TOOLS_SCHEMA = [
+    {
+        "type": "function",
+        "function": {
+            "name": "get_weather",
+            "description": "Get the weather for a city.",
+            "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"],
+            },
+        },
+    }
+]
+
+
+def _tool_call_messages():
+    return [
+        {"role": "user", "content": "What's the weather in Paris?", "tool_calls": "[]"},
+        # APIGen-MT shape: tool_calls is a JSON-encoded single dict, content is "".
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": '{"name": "get_weather", "arguments": {"city": "Paris"}}',
+        },
+        {"role": "tool", "content": '{"temp_c": 21, "conditions": "sunny"}'},
+        {"role": "assistant", "content": "It's 21C and sunny in Paris.", "tool_calls": "[]"},
+    ]
+
+
+@pytest.mark.parametrize(
+    "tools_value",
+    [
+        _TOOLS_SCHEMA,
+        json.dumps(_TOOLS_SCHEMA),
+    ],
+    ids=["list", "json-string"],
+)
+def test_chat_tool_calling_apigen_shape(tokenizer, tools_value):
+    """APIGen-MT-style row with stringified tool_calls and a separate
+    ``system``/``tools`` column tokenizes end-to-end. ``tools`` is accepted as
+    either a list[dict] (parquet-typed) or a JSON-encoded string."""
+    example = {
+        "messages": _tool_call_messages(),
+        "tools": tools_value,
+        "system": "You are a weather assistant.",
+    }
+    result = tokenize_chat_example(
+        example,
+        tokenizer,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+    assert result is not None
+    assert result["num_actions"] > 0
+    assert sum(result["loss_mask"]) > 0
+    decoded = tokenizer.decode(result["input_ids"])
+    assert "get_weather" in decoded
+    assert "You are a weather assistant." in decoded
+    assert "<tool_call>" in decoded
+    assert "<tool_response>" in decoded
+
+
+def test_chat_tool_calling_no_tools_column(tokenizer):
+    """A chat dataset without a ``tools`` or ``system`` column still tokenizes
+    when ``tools_key``/``system_key`` are explicitly disabled."""
+    example = {"messages": _tool_call_messages()}
+    result = tokenize_chat_example(
+        example,
+        tokenizer,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+        tools_key=None,
+        system_key=None,
+    )
+    assert result is not None
+    assert result["num_actions"] > 0
+
+
+def test_chat_tool_calling_trailing_tool_turn_trimmed(tokenizer):
+    """Rows that end with a trailing ``tool`` (or ``user``) turn — common in
+    APIGen-MT — should still tokenize: the trailing non-assistant turns are
+    trimmed so the conversation ends on the last assistant message."""
+    msgs = _tool_call_messages()
+    # Append a trailing tool turn with no follow-up assistant response.
+    msgs.append({"role": "tool", "content": '{"ok": true}'})
+    example = {"messages": msgs, "tools": _TOOLS_SCHEMA, "system": "You are a weather assistant."}
+    result = tokenize_chat_example(
+        example,
+        tokenizer,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+    assert result is not None
+    assert result["num_actions"] > 0
+    # The trailing observation must not appear in the tokenized stream.
+    assert '{"ok": true}' not in tokenizer.decode(result["input_ids"])
+
+
+def test_chat_tool_calling_tool_turn_masked(tokenizer):
+    """Tokens from the ``tool`` observation turn must be fully masked (loss 0).
+
+    We compute the byte range the tool turn would occupy and verify all
+    overlapping loss-mask positions are 0.
+    """
+    example = {
+        "messages": _tool_call_messages(),
+        "tools": _TOOLS_SCHEMA,
+        "system": "You are a weather assistant.",
+    }
+    result = tokenize_chat_example(
+        example,
+        tokenizer,
+        train_on_what=TrainOnWhat.ALL_ASSISTANT_MESSAGES,
+    )
+    assert result is not None
+
+    decoded = tokenizer.decode(result["input_ids"])
+    # The tool result is rendered inside <tool_response>…</tool_response>.
+    assert "21" in decoded
+    # Every tool-response token must be masked to 0. We re-tokenize the
+    # observation segment in isolation and assert that all matching positions
+    # in input_ids share the same mask=0 region.
+    obs_marker_ids = tokenizer.encode("<tool_response>", add_special_tokens=False)
+    input_ids = result["input_ids"]
+    action_start = len(input_ids) - len(result["loss_mask"])
+    # Find the index of the tool_response marker in the input_ids stream.
+    found = -1
+    for i in range(len(input_ids) - len(obs_marker_ids) + 1):
+        if input_ids[i : i + len(obs_marker_ids)] == obs_marker_ids:
+            found = i
+            break
+    assert found >= 0
+    # Every position from the marker through the closing </tool_response>
+    # marker must be masked to 0.
+    close_ids = tokenizer.encode("</tool_response>", add_special_tokens=False)
+    close = -1
+    for i in range(found, len(input_ids) - len(close_ids) + 1):
+        if input_ids[i : i + len(close_ids)] == close_ids:
+            close = i + len(close_ids)
+            break
+    assert close > found
+    for k in range(found, close):
+        if k >= action_start:
+            assert result["loss_mask"][k - action_start] == 0, f"tool-response position {k} must be masked to 0"
+
+
+# ---------------------------------------------------------------------------
+# _normalize_chat_messages: preserve fields like ``reasoning_content`` so
+# thinking-model templates (Qwen3, Nemotron-3) keep working.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_preserves_unknown_extras_on_all_roles():
+    msgs = [
+        {"role": "system", "content": "sys", "metadata": {"k": 1}},
+        {"role": "user", "content": "u", "name": "alice"},
+        {
+            "role": "assistant",
+            "content": "a",
+            "reasoning_content": "thought",
+            "custom_field": "x",
+        },
+        {
+            "role": "tool",
+            "content": '{"result": 42}',
+            "name": "calculator",
+            "tool_call_id": "call_0",
+        },
+    ]
+    out = _normalize_chat_messages(msgs)
+    assert out[0]["metadata"] == {"k": 1}
+    assert out[1]["name"] == "alice"
+    assert out[2]["reasoning_content"] == "thought"
+    assert out[2]["custom_field"] == "x"
+    assert out[3]["name"] == "calculator"
+    assert out[3]["tool_call_id"] == "call_0"
+
+
+def test_normalize_drops_placeholder_tool_calls_but_keeps_extras():
+    """Placeholder ``tool_calls="[]"`` is dropped on assistant messages even
+    when other extras are present on the same row."""
+    msgs = [
+        {
+            "role": "assistant",
+            "content": "ok",
+            "reasoning_content": "thinking...",
+            "tool_calls": "[]",
+        },
+    ]
+    out = _normalize_chat_messages(msgs)
+    assert "tool_calls" not in out[0]
+    assert out[0]["reasoning_content"] == "thinking..."
+
+
+def test_normalize_strips_tool_calls_off_non_assistant_roles():
+    """``tool_calls`` on user/tool/system rows is stripped (would fight the
+    template) while other extras survive."""
+    msgs = [
+        {"role": "user", "content": "u", "tool_calls": "[]", "name": "alice"},
+        {"role": "tool", "content": "t", "tool_calls": "[]", "tool_call_id": "c0"},
+    ]
+    out = _normalize_chat_messages(msgs)
+    assert "tool_calls" not in out[0]
+    assert out[0]["name"] == "alice"
+    assert "tool_calls" not in out[1]
+    assert out[1]["tool_call_id"] == "c0"

@@ -20,11 +20,13 @@ Or as a CLI entrypoint::
     python -m skyrl.train.main_sft strategy=megatron model.path=Qwen/Qwen3-0.6B
 """
 
+import functools
+import json
 import os
 import random
 from dataclasses import asdict
 from math import ceil
-from typing import Optional
+from typing import Any, Optional
 
 import ray
 import torch
@@ -63,6 +65,106 @@ from skyrl.utils.tok import get_tokenizer
 # ---------------------------------------------------------------------------
 # Tokenization helpers
 # ---------------------------------------------------------------------------
+
+
+@functools.lru_cache(maxsize=512)
+def _parse_tools_str(tools: str) -> Optional[tuple]:
+    """Parse a JSON-encoded tools string. Cached because tool-calling datasets
+    typically share one schema across thousands of rows (e.g. APIGen's airline
+    domain), and `apply_chat_template` re-tokenizes the schema on every row."""
+    tools = tools.strip()
+    if not tools:
+        return None
+    parsed = json.loads(tools)
+    if not parsed:
+        return None
+    # Return a tuple so the cache stores an immutable value; caller re-lists it.
+    return tuple(parsed)
+
+
+def _coerce_tools(tools: Any) -> Optional[list]:
+    """Coerce a dataset's ``tools`` field into a list[dict] for ``apply_chat_template``.
+
+    Tool-calling datasets ship the schema list as ``list[dict]`` (parquet-typed),
+    JSON-encoded ``str``, or absent. HF chat templates expect ``list[dict]``;
+    returns ``None`` when there are no tools so the caller can omit the kwarg.
+    """
+    if tools is None:
+        return None
+    if isinstance(tools, str):
+        cached = _parse_tools_str(tools)
+        return list(cached) if cached else None
+    if isinstance(tools, list):
+        return tools or None
+    raise TypeError(f"Unsupported `tools` type: {type(tools).__name__}")
+
+
+def _normalize_tool_call_payload(tc: Any) -> Optional[list]:
+    """Normalize an assistant message's ``tool_calls`` into the OpenAI-style list.
+
+    Datasets in the wild use:
+
+    * ``[]`` / ``""`` / ``None`` — no tool call;
+    * a single JSON-encoded ``{"name": ..., "arguments": ...}`` dict (APIGen-MT);
+    * a JSON-encoded list of such dicts (xLAM, ToolACE);
+    * an already-parsed list of OpenAI-style ``{"type": "function", "function": {...}}``.
+
+    HF chat templates expect ``[{"type": "function", "function": {"name", "arguments"}}]``,
+    so we coerce to that shape. Returns ``None`` when the message has no tool call.
+    """
+    if tc is None:
+        return None
+    if isinstance(tc, str):
+        tc = tc.strip()
+        if not tc or tc == "[]":
+            return None
+        tc = json.loads(tc)
+    if isinstance(tc, dict):
+        tc = [tc]
+    if not isinstance(tc, list) or not tc:
+        return None
+
+    out = []
+    for call in tc:
+        if not isinstance(call, dict):
+            raise TypeError(f"tool call entry must be a dict, got {type(call).__name__}")
+        fn = call["function"] if isinstance(call.get("function"), dict) else call
+        arguments = fn.get("arguments", {})
+        if isinstance(arguments, str):
+            try:
+                arguments = json.loads(arguments)
+            except json.JSONDecodeError:
+                pass
+        out.append({"type": "function", "function": {"name": fn.get("name"), "arguments": arguments}})
+    return out
+
+
+# Fields we explicitly normalize; everything else on the message is forwarded
+# so model-specific templates can read e.g. ``reasoning_content`` (Qwen3,
+# Nemotron-3 thinking models) or ``tool_call_id``.
+_NORMALIZED_KEYS = frozenset({"role", "content", "tool_calls"})
+
+
+def _normalize_chat_messages(messages: list[dict]) -> list[dict]:
+    """Return messages in a shape that HF chat templates accept.
+
+    Normalizes ``content`` (``None`` → ``""``), promotes string-encoded
+    ``tool_calls`` on assistant turns into the OpenAI list-of-dicts form,
+    drops empty/placeholder ``tool_calls`` on every role, and preserves any
+    other fields on the message verbatim.
+    """
+    out = []
+    for msg in messages:
+        role = msg["role"]
+        new_msg = {k: v for k, v in msg.items() if k not in _NORMALIZED_KEYS}
+        new_msg["role"] = role
+        new_msg["content"] = msg.get("content", "") or ""
+        if role == "assistant":
+            tool_calls = _normalize_tool_call_payload(msg.get("tool_calls"))
+            if tool_calls:
+                new_msg["tool_calls"] = tool_calls
+        out.append(new_msg)
+    return out
 
 
 def tokenize_sft_example(example: dict, tokenizer, max_length: int = 512, **tokenizer_kwargs) -> dict | None:
@@ -106,6 +208,8 @@ def tokenize_chat_example(
     max_length: Optional[int] = None,
     messages_key: str = "messages",
     train_on_what: TrainOnWhat = TrainOnWhat.LAST_ASSISTANT_MESSAGE,
+    tools_key: Optional[str] = "tools",
+    system_key: Optional[str] = "system",
     **tokenizer_kwargs,
 ) -> dict | None:
     """Tokenize a chat-format example with configurable loss targets.
@@ -113,12 +217,22 @@ def tokenize_chat_example(
     Uses ``apply_chat_template`` to tokenize the conversation and determine
     which tokens to train on based on ``train_on_what``.
 
+    For tool-calling datasets (e.g. APIGen-MT, xLAM, ToolACE), if the example
+    has a ``tools_key`` column, its parsed value is forwarded as ``tools=`` to
+    ``apply_chat_template`` so the model sees the function schemas. Likewise,
+    a ``system_key`` column is prepended as a leading system message when no
+    system message is already present.
+
     Args:
         example: Dict containing a ``messages_key`` column with chat messages.
         tokenizer: HuggingFace tokenizer with ``apply_chat_template``.
         max_length: Maximum sequence length (truncation boundary).
         messages_key: Key in *example* that holds the messages list.
         train_on_what: Which tokens to compute loss on.
+        tools_key: Key in *example* whose value is the per-row tool schema list
+            (or JSON-encoded string thereof). ``None`` disables the lookup.
+        system_key: Key in *example* whose value is a system prompt string.
+            ``None`` disables the lookup.
         **tokenizer_kwargs: Extra kwargs forwarded to ``apply_chat_template``
             (e.g. ``enable_thinking``).
 
@@ -134,11 +248,26 @@ def tokenize_chat_example(
             f"train_on_what={train_on_what!r} is not yet supported. "
             f"Supported values: {sorted(v.value for v in _SUPPORTED)}"
         )
-    messages = example[messages_key]
+    messages = list(example[messages_key])
 
-    # Validate: last message must be from assistant
+    # Trim trailing tool observations with no follow-up assistant response
+    # (common in APIGen-MT). Trailing user turns still drop the row.
+    while messages and messages[-1]["role"] == "tool":
+        messages.pop()
+
     if not messages or messages[-1]["role"] != "assistant":
         return None
+
+    messages = _normalize_chat_messages(messages)
+
+    system_prompt = example.get(system_key) if system_key else None
+    if system_prompt and messages[0].get("role") != "system":
+        messages = [{"role": "system", "content": system_prompt}] + messages
+
+    # Per-row schemas yield to an explicit caller-provided ``tools`` kwarg.
+    tools = _coerce_tools(example.get(tools_key)) if tools_key else None
+    if tools is not None:
+        tokenizer_kwargs = {"tools": tools, **tokenizer_kwargs}
 
     if train_on_what == TrainOnWhat.LAST_ASSISTANT_MESSAGE:
         return _tokenize_chat_last_assistant(messages, tokenizer, max_length, **tokenizer_kwargs)
@@ -441,7 +570,11 @@ class SFTTrainer:
         logger.info("Tokenizing dataset...")
 
         if self.sft_cfg.messages_key in columns:
-            # Chat format
+            # Chat format. Tool-calling datasets often ship a per-row ``tools``
+            # column (function schemas) and ``system`` column (domain policy)
+            # alongside ``messages``; thread those through when present.
+            tools_key = self.sft_cfg.tools_key if self.sft_cfg.tools_key in columns else None
+            system_key = self.sft_cfg.system_key if self.sft_cfg.system_key in columns else None
             tokenized = [
                 tokenize_chat_example(
                     ex,
@@ -449,6 +582,8 @@ class SFTTrainer:
                     self.sft_cfg.max_length,
                     self.sft_cfg.messages_key,
                     train_on_what=self.sft_cfg.train_on_what,
+                    tools_key=tools_key,
+                    system_key=system_key,
                 )
                 for ex in dataset
             ]
